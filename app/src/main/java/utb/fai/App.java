@@ -3,54 +3,148 @@
  */
 package utb.fai;
 
-import java.io.BufferedReader;
-import java.io.FileNotFoundException;
-import java.io.InputStreamReader;
-import java.net.URI;
-import java.util.HashSet;
-import java.util.LinkedList;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
-import javax.swing.text.html.parser.ParserDelegator;
+import java.net.URI;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class App {
 
-	public static void main(String[] args) {
-		LinkedList<URIinfo> foundURIs = new LinkedList<URIinfo>();
-		HashSet<URI> visitedURIs = new HashSet<URI>();
-		URI uri;
-		try {
-			uri = new URI(args[0] + "/");
-			foundURIs.add(new URIinfo(uri, 0));
-			visitedURIs.add(uri);
+    private static final Set<String> visitedURIs = ConcurrentHashMap.newKeySet();
 
-			if (args.length < 1) {
-				System.err.println("Missing parameter - start URL");
-				return;
-			}
-			/**
-			 * Zde zpracujte dalí parametry - maxDepth a debugLevel
-			 */
+    private static final ConcurrentHashMap<String, AtomicInteger> wordCounts = new ConcurrentHashMap<>();
 
-			ParserCallback callBack = new ParserCallback(visitedURIs, foundURIs);
-			ParserDelegator parser = new ParserDelegator();
+    private static final AtomicInteger activeTasks = new AtomicInteger(0);
+    private static final CountDownLatch doneLatch = new CountDownLatch(1);
 
-			while (!foundURIs.isEmpty()) {
-				URIinfo URIinfo = foundURIs.removeFirst();
-				callBack.depth = URIinfo.depth;
-				callBack.pageURI = uri = URIinfo.uri;
-				System.err.println("Analyzing " + uri);
-				try {
-					BufferedReader reader = new BufferedReader(new InputStreamReader(uri.toURL().openStream()));
-					parser.parse(reader, callBack, true);
-					reader.close();
-				} catch (FileNotFoundException e) {
-					System.err.println("Error loading page - does it exist?");
-				}
-			}
-		} catch (Exception e) {
-			System.err.println("Zachycena neoetøená výjimka, konèíme...");
-			e.printStackTrace();
-		}
-	}
+    private static ExecutorService executor;
+    private static int maxDepth = 2;
+    private static int debugLevel = 0;
 
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Chyba: Zadejte startovni URL jako prvni parametr.");
+            return;
+        }
+
+        String startUrl = args[0];
+
+        if (args.length >= 2) {
+            try {
+                maxDepth = Integer.parseInt(args[1]);
+            } catch (NumberFormatException e) {
+                System.err.println("Neplatna hloubka, pouzita vychozi hodnota 2.");
+            }
+        }
+
+        if (args.length >= 3) {
+            try {
+                debugLevel = Integer.parseInt(args[2]);
+            } catch (NumberFormatException e) {
+                debugLevel = 0;
+            }
+        }
+
+        int threads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
+        executor = Executors.newFixedThreadPool(threads);
+
+        submitUrl(startUrl, 0);
+
+        try {
+            doneLatch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executor.shutdown();
+        }
+
+        wordCounts.entrySet().stream()
+                .sorted((e1, e2) -> Integer.compare(e2.getValue().get(), e1.getValue().get()))
+                .limit(20)
+                .forEach(entry -> System.out.println(entry.getKey() + ";" + entry.getValue().get()));
+    }
+
+    private static void submitUrl(String url, int depth) {
+        if (depth > maxDepth || url == null || url.isEmpty()) {
+            return;
+        }
+
+        String normalizedUrl = normalizeUrl(url);
+        if (normalizedUrl == null) {
+            return;
+        }
+
+        if (!visitedURIs.add(normalizedUrl)) {
+            return;
+        }
+
+        activeTasks.incrementAndGet();
+        executor.submit(() -> {
+            try {
+                processUrl(normalizedUrl, depth);
+            } finally {
+                if (activeTasks.decrementAndGet() == 0) {
+                    doneLatch.countDown();
+                }
+            }
+        });
+    }
+
+    private static void processUrl(String url, int depth) {
+        if (debugLevel > 0) {
+            System.err.println("Zpracovavam [" + depth + "]: " + url);
+        }
+
+        try {
+            Document doc = Jsoup.connect(url)
+                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    .timeout(5000)
+                    .ignoreContentType(false)
+                    .get();
+
+            String text = (doc.body() != null) ? doc.body().text() : doc.text();
+            if (text != null && !text.isEmpty()) {
+                String[] words = text.toLowerCase().split("[^\\p{L}]+");
+                for (String word : words) {
+                    if (!word.isEmpty()) {
+                        wordCounts.computeIfAbsent(word, k -> new AtomicInteger(0)).incrementAndGet();
+                    }
+                }
+            }
+
+            if (depth < maxDepth) {
+                Elements links = doc.select("a[href]");
+                for (Element link : links) {
+                    String absHref = link.absUrl("href");
+                    if (absHref.startsWith("http://") || absHref.startsWith("https://")) {
+                        submitUrl(absHref, depth + 1);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            if (debugLevel > 0) {
+                System.err.println("Chyba pri nacitani " + url + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private static String normalizeUrl(String url) {
+        try {
+            URI uri = new URI(url).normalize();
+            String scheme = uri.getScheme();
+            if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                return null;
+            }
+            int hashIndex = url.indexOf('#');
+            return (hashIndex != -1) ? url.substring(0, hashIndex) : url;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }
